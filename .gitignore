@@ -1,6 +1,9 @@
 # CMake build directory
 build*/
 
+# Install directory
+install/
+
 # Backup files.
 *~
 
