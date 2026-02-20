@@ -491,6 +491,198 @@ https://github.com/Tencent/ncnn/releases/latest
 
 ---
 
+## CHIMERA-FAS Optimizations (this fork)
+
+This fork includes two performance optimizations for x86 CPUs targeting the CHIMERA-FAS v4 face anti-spoofing model. These changes are generic and benefit any model that uses Gemm and Reduction layers.
+
+### What's changed
+
+| Optimization | Files | Speedup |
+|---|---|---|
+| **MLAS SGEMM** — Pre-packed B weights using Microsoft MLAS library | `gemm_x86.h`, `gemm_x86.cpp`, `CMakeLists.txt`, `src/CMakeLists.txt`, `src/platform.h.in` | ~20% on Gemm layers |
+| **Reduction_x86** — AVX-512/AVX/SSE2 vectorized Reduction with cache-friendly access and native elempack support | `reduction_x86.h`, `reduction_x86.cpp` (new) | ~10x on Reduction layers |
+
+**Combined result on Ryzen 9 5900X (CHIMERA-FAS v4):** 253ms → 174ms (31% faster)
+
+### Prerequisites
+
+- Linux x86_64 (tested on Ubuntu 22.04+)
+- CMake >= 3.14
+- GCC with C++17 support
+- CPU with AVX2 support (AVX-512 optional, auto-detected)
+
+### Step 1: Build MLAS (Microsoft Linear Algebra Subroutines)
+
+MLAS is extracted from ONNX Runtime via sparse checkout. If you already have it built, skip to Step 2.
+
+```bash
+# Clone only the MLAS portion of ONNX Runtime
+mkdir onnxruntime-mlas && cd onnxruntime-mlas
+git init
+git remote add origin https://github.com/microsoft/onnxruntime.git
+git config core.sparseCheckout true
+cat > .git/info/sparse-checkout << 'EOF'
+onnxruntime/core/mlas/
+onnxruntime/core/common/common.h
+onnxruntime/core/common/narrow.h
+EOF
+git pull --depth=1 origin main
+```
+
+Create the standalone CMakeLists.txt for MLAS:
+
+```bash
+cat > CMakeLists.txt << 'CMAKEOF'
+cmake_minimum_required(VERSION 3.14)
+project(mlas C CXX ASM)
+
+set(CMAKE_CXX_STANDARD 17)
+set(MLAS_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/lib)
+
+file(GLOB MLAS_SRCS
+    "${MLAS_SRC_DIR}/*.cpp"
+    "${MLAS_SRC_DIR}/x86_64/*.S"
+)
+
+# Remove platform-specific files we don't need on Linux x86_64
+list(FILTER MLAS_SRCS EXCLUDE REGEX ".*(/sqnbitgemm_kernel_neon|_neon|_power|_wasm).*")
+
+add_library(mlas STATIC ${MLAS_SRCS})
+
+target_include_directories(mlas PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/inc
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_definitions(mlas PRIVATE
+    BUILD_MLAS_NO_ONNXRUNTIME=1
+    MLAS_NO_ONNXRUNTIME_THREADPOOL=1
+)
+
+target_compile_options(mlas PRIVATE
+    -mavx2 -mfma -mavx512f -mavx512bw -mavx512dq -mavx512vl
+    -fopenmp -O3
+)
+
+install(TARGETS mlas ARCHIVE DESTINATION lib)
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/inc/mlas.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/inc/mlas_float16.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/inc/mlas_gemm_postprocessor.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/inc/mlas_q4.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/core/mlas/inc/mlas_qnbit.h
+    DESTINATION include/mlas
+)
+CMAKEOF
+```
+
+You also need to stub out the ORT threading to use OpenMP. Edit `onnxruntime/core/mlas/lib/mlasi.h` and replace the `GetMlasThreadPool` function to use `omp_get_max_threads()`. Edit `onnxruntime/core/mlas/lib/threading.cpp` similarly. Create stub headers for `onnxruntime/core/common/common.h` and `narrow.h`.
+
+```bash
+# Build MLAS
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+cmake --install . --prefix ../install
+cd ../..
+```
+
+After this you should have:
+```
+onnxruntime-mlas/install/
+├── include/mlas/
+│   └── mlas.h (+ other headers)
+└── lib/
+    └── libmlas.a
+```
+
+### Step 2: Build NCNN with MLAS
+
+```bash
+cd ncnn_src
+mkdir -p build && cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DNCNN_MLAS=ON \
+    -DMLAS_ROOT=/path/to/onnxruntime-mlas/install \
+    -DNCNN_AVX2=ON \
+    -DNCNN_AVX512=ON \
+    -DNCNN_AVX=ON \
+    -DNCNN_FMA=ON \
+    -DNCNN_F16C=ON \
+    -DNCNN_SSE2=ON \
+    -DNCNN_AVX512VNNI=ON \
+    -DNCNN_AVX512BF16=ON \
+    -DNCNN_VULKAN=OFF
+
+make -j$(nproc)
+cmake --install . --prefix ../install
+```
+
+> **Note:** If your CPU doesn't support AVX-512, remove the `NCNN_AVX512*` flags. The Reduction_x86 layer will fall back to AVX/SSE2 automatically.
+
+### Step 3: Build without MLAS (Reduction_x86 only)
+
+If you only want the Reduction optimization without the MLAS dependency:
+
+```bash
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DNCNN_MLAS=OFF \
+    -DNCNN_AVX2=ON \
+    -DNCNN_AVX=ON \
+    -DNCNN_FMA=ON \
+    -DNCNN_SSE2=ON \
+    -DNCNN_VULKAN=OFF
+
+make -j$(nproc)
+```
+
+The Reduction_x86 layer is automatically compiled when the x86 platform is detected — no extra flags needed.
+
+### Step 4: Build your application
+
+Link your application against the optimized ncnn. If MLAS was used, you must also link `libmlas.a`:
+
+```bash
+cmake .. \
+    -Dncnn_DIR=/path/to/ncnn_src/install/lib/cmake/ncnn \
+    -DMLAS_ROOT=/path/to/onnxruntime-mlas/install
+
+make -j$(nproc)
+```
+
+### Thread tuning
+
+MLAS uses OpenMP for thread parallelism. Set threads via environment variable:
+
+```bash
+export OMP_NUM_THREADS=16    # Adjust for your CPU
+./your_application
+```
+
+Or set it programmatically in ncnn:
+
+```cpp
+ncnn::Option opt;
+opt.num_threads = 16;
+```
+
+Best thread count depends on your CPU. For Ryzen 9 5900X (12C/24T), T=16 was optimal.
+
+### Benchmarks (CHIMERA-FAS v4, Ryzen 9 5900X)
+
+| Configuration | Inference time | vs baseline |
+|---|---|---|
+| Baseline (ncnn stock, T=8) | 253 ms | — |
+| + MLAS pre-packed B (T=16) | 210 ms | -17% |
+| + Reduction_x86 AVX-512 | **174 ms** | **-31%** |
+| ONNX Runtime (reference) | 110 ms | — |
+
+---
+
 ## Support most commonly used CNN network
 
 ## 支持大部分常用的 CNN 网络
