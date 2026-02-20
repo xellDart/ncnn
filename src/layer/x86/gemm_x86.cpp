@@ -18,6 +18,11 @@
 
 #include "cpu.h"
 
+#if NCNN_MLAS
+#include "mlas.h"
+#include <omp.h>
+#endif
+
 namespace ncnn {
 
 #if NCNN_INT8
@@ -31,7 +36,22 @@ Gemm_x86::Gemm_x86()
 #endif // __SSE2__
 
     nT = 0;
+#if NCNN_MLAS
+    B_packed_mlas = nullptr;
+    B_packed_mlas_size = 0;
+#endif
 }
+
+#if NCNN_MLAS
+Gemm_x86::~Gemm_x86()
+{
+    if (B_packed_mlas)
+    {
+        free(B_packed_mlas);
+        B_packed_mlas = nullptr;
+    }
+}
+#endif
 
 static void pack_A_tile(const Mat& A, Mat& AT, int i, int max_ii, int k, int max_kk)
 {
@@ -7255,6 +7275,28 @@ int Gemm_x86::create_pipeline(const Option& opt)
 
     if (constantB)
     {
+#if NCNN_MLAS
+        // Pre-pack B for MLAS SGEMM (pack once, use every forward)
+        {
+            const int N = constantN;
+            const int K = constantK;
+            CBLAS_TRANSPOSE transA_cblas = transA ? CblasTrans : CblasNoTrans;
+            CBLAS_TRANSPOSE transB_cblas = transB ? CblasTrans : CblasNoTrans;
+            size_t ldb = transB ? K : N;
+
+            B_packed_mlas_size = MlasGemmPackBSize(transA_cblas, transB_cblas, (size_t)N, (size_t)K);
+
+            if (posix_memalign(&B_packed_mlas, 64, B_packed_mlas_size) != 0)
+                return -100;
+
+            MlasGemmPackB(transA_cblas, transB_cblas,
+                          (size_t)N, (size_t)K,
+                          (const float*)B_data, ldb,
+                          B_packed_mlas);
+        }
+        if (opt.lightmode)
+            B_data.release();
+#else
         const int N = constantN;
         const int K = constantK;
 
@@ -7295,6 +7337,7 @@ int Gemm_x86::create_pipeline(const Option& opt)
 
         if (opt.lightmode)
             B_data.release();
+#endif // NCNN_MLAS
     }
 
     if (constantC && constant_broadcast_type_C != -1)
@@ -7507,6 +7550,65 @@ int Gemm_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& to
     }
 
     int ret = 0;
+
+#if NCNN_MLAS
+    // MLAS fast path: constantB with pre-packed B
+    if (constantB && !constantA && !output_transpose
+        && B_packed_mlas != nullptr)
+    {
+        const Mat& A_raw = bottom_blobs[0];
+        const int K = constantK;
+        const int N_val = constantN;
+
+        // Flatten A to elempack=1 if needed
+        Mat A_flat;
+        if (A_raw.elempack != 1)
+            convert_packing(A_raw, A_flat, 1, opt);
+        const Mat& A = (A_raw.elempack == 1) ? A_raw : A_flat;
+
+        const float* A_ptr = (const float*)A;
+
+        // Output: always elempack=1 for MLAS, (M, N) row-major
+        if (out_elempack != 1)
+        {
+            top_blob.create(N_val, M, 4u, 1, opt.blob_allocator);
+            if (top_blob.empty())
+                return -100;
+        }
+        float* out_ptr = (float*)top_blob;
+
+        // Initialize output with bias if present
+        float beta_val = 0.f;
+        if (!C.empty() && broadcast_type_C == 4)
+        {
+            const float* bias_ptr = (const float*)C;
+            for (int i = 0; i < M; i++)
+                memcpy(out_ptr + i * N_val, bias_ptr, N_val * sizeof(float));
+            beta_val = 1.f;
+        }
+        else if (!C.empty() && broadcast_type_C == 0)
+        {
+            float val = ((const float*)C)[0];
+            for (int i = 0; i < M * N_val; i++)
+                out_ptr[i] = val;
+            beta_val = 1.f;
+        }
+
+        CBLAS_TRANSPOSE transA_cblas = transA ? CblasTrans : CblasNoTrans;
+        size_t lda = transA ? M : K;
+
+        // Use MLAS pre-packed B overload — no per-call packing overhead
+        MlasGemm(transA_cblas,
+                  (size_t)M, (size_t)N_val, (size_t)K,
+                  alpha, A_ptr, lda,
+                  B_packed_mlas,
+                  beta_val, out_ptr, (size_t)N_val,
+                  nullptr);
+
+        return 0;
+    }
+#endif // NCNN_MLAS
+
     if (constantA && constantB)
     {
         ret = gemm_AT_BT_x86(AT_data, BT_data, C, top_blob, broadcast_type_C, constantM, constantN, constantK, output_transpose, constant_TILE_M, constant_TILE_N, constant_TILE_K, _nT, opt);

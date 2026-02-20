@@ -12,6 +12,9 @@ class Gemm_x86 : public Gemm
 {
 public:
     Gemm_x86();
+#if NCNN_MLAS
+    virtual ~Gemm_x86();
+#endif
 
     virtual int create_pipeline(const Option& opt);
 
@@ -28,6 +31,10 @@ public:
     Mat AT_data;
     Mat BT_data;
     Mat CT_data;
+#if NCNN_MLAS
+    void* B_packed_mlas;      // MLAS pre-packed B buffer
+    size_t B_packed_mlas_size; // size of pre-packed buffer
+#endif
 };
 
 // expose some gemm internal routines for convolution uses
