@@ -17,6 +17,10 @@
 
 #include "cpu.h"
 
+#if NCNN_MLAS
+#include "mlas.h"
+#endif
+
 namespace ncnn {
 
 #include "innerproduct_fp.h"
@@ -36,7 +40,23 @@ InnerProduct_x86::InnerProduct_x86()
 #endif // __SSE2__
 
     flatten = 0;
+
+#if NCNN_MLAS
+    B_packed_mlas = nullptr;
+    B_packed_mlas_size = 0;
+#endif
 }
+
+#if NCNN_MLAS
+InnerProduct_x86::~InnerProduct_x86()
+{
+    if (B_packed_mlas)
+    {
+        free(B_packed_mlas);
+        B_packed_mlas = nullptr;
+    }
+}
+#endif
 
 int InnerProduct_x86::create_pipeline(const Option& opt)
 {
@@ -66,6 +86,24 @@ int InnerProduct_x86::create_pipeline(const Option& opt)
 #endif
 
     const int num_input = weight_data_size / num_output;
+
+#if NCNN_MLAS
+    // Pre-pack B for MLAS SGEMM
+    // InnerProduct: output = input * W^T + bias
+    // W is [num_output, num_input], transB = CblasTrans
+    {
+        B_packed_mlas_size = MlasGemmPackBSize(CblasNoTrans, CblasTrans,
+                                               (size_t)num_output, (size_t)num_input);
+
+        if (posix_memalign(&B_packed_mlas, 64, B_packed_mlas_size) != 0)
+            return -100;
+
+        MlasGemmPackB(CblasNoTrans, CblasTrans,
+                      (size_t)num_output, (size_t)num_input,
+                      (const float*)weight_data, (size_t)num_input,
+                      B_packed_mlas);
+    }
+#endif
 
     innerproduct_transform_kernel_sse(weight_data, weight_data_tm, num_input, num_output, opt);
 
@@ -104,6 +142,89 @@ int InnerProduct_x86::forward(const Mat& bottom_blob, Mat& top_blob, const Optio
 #endif
 
     const int num_input = weight_data_size / num_output;
+
+#if NCNN_MLAS
+    if (B_packed_mlas)
+    {
+        // flatten
+        Mat bottom_blob_flattened = bottom_blob;
+        if (bottom_blob.dims != 1)
+        {
+            Option opt_flatten = opt;
+            opt_flatten.blob_allocator = opt.workspace_allocator;
+            flatten->forward(bottom_blob, bottom_blob_flattened, opt_flatten);
+            if (bottom_blob_flattened.empty())
+                return -100;
+        }
+
+        int M = 1; // single input
+        if (bottom_blob.dims == 2 && bottom_blob.w == num_input)
+            M = bottom_blob.h;
+
+        const float* A = (const float*)bottom_blob_flattened;
+        size_t lda = (size_t)num_input;
+
+        top_blob.create(num_output, M, 4u, 1, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        float* C = (float*)top_blob;
+        size_t ldc = (size_t)num_output;
+
+        // Pre-fill output with bias (MlasGemm beta=1.0 will add to it)
+        if (bias_term)
+        {
+            const float* bias = (const float*)bias_data;
+            for (int m = 0; m < M; m++)
+            {
+                float* row = C + m * num_output;
+                memcpy(row, bias, num_output * sizeof(float));
+            }
+        }
+        else
+        {
+            memset(C, 0, M * num_output * sizeof(float));
+        }
+
+        MlasGemm(CblasNoTrans,
+                  (size_t)M, (size_t)num_output, (size_t)num_input,
+                  1.0f, A, lda,
+                  B_packed_mlas,
+                  1.0f, C, ldc,
+                  nullptr);
+
+        // Apply activation
+        if (activation_type == 1) // ReLU
+        {
+            int total = M * num_output;
+            for (int i = 0; i < total; i++)
+                C[i] = std::max(C[i], 0.f);
+        }
+        else if (activation_type == 2) // LeakyReLU
+        {
+            float slope = activation_params[0];
+            int total = M * num_output;
+            for (int i = 0; i < total; i++)
+                C[i] = C[i] > 0.f ? C[i] : C[i] * slope;
+        }
+        else if (activation_type == 3) // Clip
+        {
+            float min_val = activation_params[0];
+            float max_val = activation_params[1];
+            int total = M * num_output;
+            for (int i = 0; i < total; i++)
+                C[i] = std::min(std::max(C[i], min_val), max_val);
+        }
+        else if (activation_type == 4) // Sigmoid
+        {
+            int total = M * num_output;
+            for (int i = 0; i < total; i++)
+                C[i] = 1.f / (1.f + expf(-C[i]));
+        }
+
+        return 0;
+    }
+#endif // NCNN_MLAS
 
     if (bottom_blob.dims == 2 && bottom_blob.w == num_input)
     {

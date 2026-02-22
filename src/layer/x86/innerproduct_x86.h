@@ -12,6 +12,9 @@ class InnerProduct_x86 : public InnerProduct
 {
 public:
     InnerProduct_x86();
+#if NCNN_MLAS
+    virtual ~InnerProduct_x86();
+#endif
 
     virtual int create_pipeline(const Option& opt);
     virtual int destroy_pipeline(const Option& opt);
@@ -32,6 +35,11 @@ public:
     Layer* flatten;
 
     Mat weight_data_tm;
+
+#if NCNN_MLAS
+    void* B_packed_mlas;
+    size_t B_packed_mlas_size;
+#endif
 
 #if NCNN_INT8
     Mat scale_in_data;
