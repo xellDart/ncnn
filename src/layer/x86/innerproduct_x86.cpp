@@ -93,7 +93,7 @@ int InnerProduct_x86::create_pipeline(const Option& opt)
     // W is [num_output, num_input], transB = CblasTrans
     {
         B_packed_mlas_size = MlasGemmPackBSize(CblasNoTrans, CblasTrans,
-                                               (size_t)num_output, (size_t)num_input);
+                                               (size_t)num_output, (size_t)num_input, nullptr);
 
         if (posix_memalign(&B_packed_mlas, 64, B_packed_mlas_size) != 0)
             return -100;
@@ -101,7 +101,7 @@ int InnerProduct_x86::create_pipeline(const Option& opt)
         MlasGemmPackB(CblasNoTrans, CblasTrans,
                       (size_t)num_output, (size_t)num_input,
                       (const float*)weight_data, (size_t)num_input,
-                      B_packed_mlas);
+                      B_packed_mlas, nullptr);
     }
 #endif
 
@@ -191,7 +191,7 @@ int InnerProduct_x86::forward(const Mat& bottom_blob, Mat& top_blob, const Optio
                   1.0f, A, lda,
                   B_packed_mlas,
                   1.0f, C, ldc,
-                  nullptr);
+                  nullptr, nullptr);
 
         // Apply activation
         if (activation_type == 1) // ReLU

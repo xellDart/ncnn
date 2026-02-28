@@ -7284,7 +7284,7 @@ int Gemm_x86::create_pipeline(const Option& opt)
             CBLAS_TRANSPOSE transB_cblas = transB ? CblasTrans : CblasNoTrans;
             size_t ldb = transB ? K : N;
 
-            B_packed_mlas_size = MlasGemmPackBSize(transA_cblas, transB_cblas, (size_t)N, (size_t)K);
+            B_packed_mlas_size = MlasGemmPackBSize(transA_cblas, transB_cblas, (size_t)N, (size_t)K, nullptr);
 
             if (posix_memalign(&B_packed_mlas, 64, B_packed_mlas_size) != 0)
                 return -100;
@@ -7292,7 +7292,7 @@ int Gemm_x86::create_pipeline(const Option& opt)
             MlasGemmPackB(transA_cblas, transB_cblas,
                           (size_t)N, (size_t)K,
                           (const float*)B_data, ldb,
-                          B_packed_mlas);
+                          B_packed_mlas, nullptr);
         }
         if (opt.lightmode)
             B_data.release();
@@ -7603,7 +7603,7 @@ int Gemm_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& to
                   alpha, A_ptr, lda,
                   B_packed_mlas,
                   beta_val, out_ptr, (size_t)N_val,
-                  nullptr);
+                  nullptr, nullptr);
 
         return 0;
     }
